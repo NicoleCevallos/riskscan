@@ -8,6 +8,8 @@ from . import models, crud
 from .scanners.text_pii import scan_caption
 from .scanners.exif_gps import scan_image_for_gps
 from .scoring import score_from_detections
+from fastapi.responses import FileResponse
+
 
 # --- NEW TikTok imports ---
 from .tiktok import models as tiktok_models   # register tables
@@ -60,3 +62,8 @@ def get_post(post_id: int, db: Session = Depends(get_db)):
     if not bundle:
         raise HTTPException(status_code=404, detail="Post not found")
     return bundle
+
+@app.get("/tiktokVU7kUTuHmBNCRTt1Ys1J2fKbjXJi5v3v.txt")
+def serve_tiktok_verification():
+    file_path = os.path.join(os.path.dirname(__file__), "..", "tiktokVU7kUTuHmBNCRTt1Ys1J2fKbjXJi5v3v.txt")
+    return FileResponse(file_path, media_type="text/plain")
