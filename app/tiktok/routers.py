@@ -1,247 +1,175 @@
-import os
-import re
-import httpx
+# app/tiktok/routers.py
 import base64
 import hashlib
+import os
+import time
 import secrets
-import urllib.parse
-from uuid import uuid4
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Any, Dict, List
+from typing import Optional
+from urllib.parse import urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import RedirectResponse
-from sqlalchemy.orm import Session
-
-from ..database import get_db
-from .models import TikTokUser, TikTokVideo
-
-# ---------- ENV & CONSTANTS ----------
-TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "xxx")
-TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "xxx")
-TIKTOK_REDIRECT_URI = os.getenv("TIKTOK_REDIRECT_URI", "http://localhost:8000/tiktok/callback")
-
-TIKTOK_AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
-TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
-TIKTOK_VIDEO_LIST = "https://open.tiktokapis.com/v2/video/list/"
-REQUEST_SCOPES = ["user.info.basic", "video.list"]
+import httpx
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import RedirectResponse, JSONResponse
 
 router = APIRouter(prefix="/tiktok", tags=["tiktok"])
 
-# ---------- PKCE helpers ----------
-def _generate_pkce_pair() -> tuple[str, str]:
-    """
-    Returns (code_verifier, code_challenge) using S256 per RFC 7636.
-    """
-    code_verifier = secrets.token_urlsafe(64)
-    code_challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(code_verifier.encode("utf-8")).digest()
-    ).rstrip(b"=").decode("utf-8")
-    return code_verifier, code_challenge
+# ---- Env ----
+TT_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY", "")
+TT_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "")
+TT_REDIRECT_URI = os.getenv("TIKTOK_REDIRECT_URI", "")
+TT_SCOPES = "user.info.basic,video.list"
 
-# In-memory cache for pilot. (For production, store per-session/user.)
-PKCE_CACHE: dict[str, str] = {}   # state -> code_verifier
+AUTH_URL = "https://www.tiktok.com/v2/auth/authorize/"
+TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
+VIDEO_LIST_URL = "https://open.tiktokapis.com/v2/video/list/"
 
-def _build_auth_url(state: str, code_challenge: str) -> str:
-    scope_str = " ".join(REQUEST_SCOPES)
-    return (
-        f"{TIKTOK_AUTH_URL}"
-        f"?client_key={urllib.parse.quote(TIKTOK_CLIENT_KEY)}"
-        f"&response_type=code"
-        f"&scope={urllib.parse.quote(scope_str)}"
-        f"&redirect_uri={urllib.parse.quote(TIKTOK_REDIRECT_URI, safe='')}"
-        f"&state={urllib.parse.quote(state)}"
-        f"&code_challenge={urllib.parse.quote(code_challenge)}"
-        f"&code_challenge_method=S256"
-    )
+# state -> (code_verifier, created_at)
+PKCE_STORE: dict[str, tuple[str, float]] = {}
 
-# ---------- SCORING ----------
-LOC_PAT = re.compile(r"\b(UNCC|Charlotte|CLT|Uptown|South End|NoDa|Plaza Midwood|📍|\d{3,5}\s+\w+)\b", re.I)
-CONTACT_PAT = re.compile(r"(@\w+|\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b|\b\w+@\w+\.\w+\b)", re.I)
-TIME_PAT = re.compile(r"\b(mon|tue|wed|thu|fri|sat|sun)\b.*\b(\d{1,2}(:\d{2})?\s?(am|pm))|\bevery\b|\btonight\b", re.I)
-WORK_PAT = re.compile(r"\b(work|shift|on duty|campus job|host|bartend)\b", re.I)
 
-def _score_caption(caption: Optional[str]) -> Dict[str, Any]:
-    if not caption:
-        return {"score": 0, "band": "low", "factors": {"caption_length": 0, "ocr_cover_text": None}, "detections": []}
-    s = 0
-    det: List[str] = []
-    if LOC_PAT.search(caption): s += 40; det.append("possible_location")
-    if CONTACT_PAT.search(caption): s += 25; det.append("contact_info")
-    if TIME_PAT.search(caption): s += 20; det.append("schedule_time")
-    if WORK_PAT.search(caption): s += 15; det.append("workplace")
-    band = "low" if s < 20 else "medium" if s < 50 else "high"
-    return {"score": s, "band": band, "factors": {"caption_length": len(caption), "ocr_cover_text": None}, "detections": det}
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
-def _recs_from_detections(detections: List[str]) -> List[str]:
-    r: List[str] = []
-    if "possible_location" in detections or "schedule_time" in detections:
-        r.append("Remove or generalize exact locations and schedules in captions.")
-    if "contact_info" in detections:
-        r.append("Remove phone, email, or @handles from public captions.")
-    if detections:
-        r.append("Tighten TikTok privacy settings for past posts (friends-only or private).")
-    if not r:
-        r.append("No issues detected. Keep captions generic and avoid contact/location details.")
-    return r[:4]
 
-# ---------- ROUTES ----------
+def _make_pkce() -> tuple[str, str]:
+    verifier = _b64url(secrets.token_urlsafe(64).encode())[:128]
+    challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
+    return verifier, challenge
 
-@router.get("/login-url")
-def login_url():
-    """
-    Helper endpoint for Swagger: returns the TikTok OAuth URL with PKCE.
-    """
-    state = str(uuid4())
-    code_verifier, code_challenge = _generate_pkce_pair()
-    PKCE_CACHE[state] = code_verifier
-    return {"auth_url": _build_auth_url(state, code_challenge), "state": state}
+
+def _bad(v: str) -> bool:
+    # missing or looks like a placeholder
+    if not v:
+        return True
+    vv = v.strip().lower()
+    return vv.startswith("<") and vv.endswith(">")
+
+
+def _require_env():
+    if _bad(TT_CLIENT_KEY):
+        raise HTTPException(
+            status_code=500,
+            detail="TIKTOK_CLIENT_KEY missing/placeholder. Set real Client Key in Railway Variables.",
+        )
+    if _bad(TT_CLIENT_SECRET):
+        raise HTTPException(
+            status_code=500,
+            detail="TIKTOK_CLIENT_SECRET missing/placeholder. Set real Client Secret in Railway Variables.",
+        )
+    if _bad(TT_REDIRECT_URI):
+        raise HTTPException(
+            status_code=500,
+            detail="TIKTOK_REDIRECT_URI missing/placeholder. Must match TikTok Login Kit exactly.",
+        )
+
+
+@router.get("/debug")
+async def debug():
+    """Simple diagnostics to verify server-side config (masked/safe)."""
+    return {
+        "client_key_set": bool(TT_CLIENT_KEY) and not _bad(TT_CLIENT_KEY),
+        "redirect_uri": TT_REDIRECT_URI,
+        "scopes": TT_SCOPES,
+    }
+
 
 @router.get("/login")
-def login():
-    """
-    Browser-friendly redirect to TikTok OAuth with PKCE.
-    """
-    state = str(uuid4())
-    code_verifier, code_challenge = _generate_pkce_pair()
-    PKCE_CACHE[state] = code_verifier
-    return RedirectResponse(_build_auth_url(state, code_challenge))
+async def login():
+    _require_env()
+    verifier, challenge = _make_pkce()
+    state = secrets.token_urlsafe(24)
+    PKCE_STORE[state] = (verifier, time.time())
+
+    params = {
+        "client_key": TT_CLIENT_KEY,
+        "scope": TT_SCOPES,
+        "response_type": "code",
+        "redirect_uri": TT_REDIRECT_URI,
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    return RedirectResponse(f"{AUTH_URL}?{urlencode(params)}")
+
 
 @router.get("/callback")
-async def callback(code: str, state: Optional[str] = None, db: Session = Depends(get_db)):
-    # Retrieve and clear the verifier (single-use)
-    code_verifier = PKCE_CACHE.pop(state or "", None)
-    if not code_verifier:
-        raise HTTPException(400, "Missing PKCE verifier; start login again.")
+async def callback(code: Optional[str] = None, state: Optional[str] = None):
+    _require_env()
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing code or state")
 
-    # Exchange code for token
-    async with httpx.AsyncClient(timeout=30) as client:
-        data = {
-            "client_key": TIKTOK_CLIENT_KEY,
-            "client_secret": TIKTOK_CLIENT_SECRET,
-            "code": code,
-            "grant_type": "authorization_code",
-            "redirect_uri": TIKTOK_REDIRECT_URI,
-            "code_verifier": code_verifier,
-        }
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        tok = await client.post(TIKTOK_TOKEN_URL, data=data, headers=headers)
-        if tok.status_code != 200:
-            raise HTTPException(tok.status_code, tok.text)
-        tj = tok.json()["data"]
-        access_token = tj["access_token"]
-        refresh_token = tj.get("refresh_token")
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=int(tj["expires_in"]))
+    slot = PKCE_STORE.pop(state, None)
+    if not slot or time.time() - slot[1] > 600:
+        raise HTTPException(status_code=400, detail="Invalid/expired state")
 
-        # Get user info (open_id etc.)
-        uinfo = await client.get(
-            "https://open.tiktokapis.com/v2/user/info/",
-            headers={"Authorization": f"Bearer {access_token}"},
-            params={"fields": "open_id,display_name,avatar_url"}
+    code_verifier = slot[0]
+    form = {
+        "client_key": TT_CLIENT_KEY,
+        "client_secret": TT_CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": TT_REDIRECT_URI,
+        "code_verifier": code_verifier,
+    }
+
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(
+            TOKEN_URL,
+            data=form,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        if uinfo.status_code != 200:
-            raise HTTPException(uinfo.status_code, uinfo.text)
-        user = uinfo.json()["data"]["user"]
-        open_id = user["open_id"]
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Token exchange failed: {r.text}")
+        tok = r.json()
 
-        rec = db.query(TikTokUser).filter_by(open_id=open_id).first()
-        if not rec:
-            rec = TikTokUser(
-                open_id=open_id,
-                access_token=access_token,
-                refresh_token=refresh_token,
-                expires_at=expires_at,
-                display_name=user.get("display_name"),
-                avatar_url=user.get("avatar_url"),
-            )
-            db.add(rec)
-        else:
-            rec.access_token = access_token
-            rec.refresh_token = refresh_token
-            rec.expires_at = expires_at
-            rec.display_name = user.get("display_name") or rec.display_name
-            rec.avatar_url = user.get("avatar_url") or rec.avatar_url
-        db.commit()
+    resp = JSONResponse(
+        {
+            "ok": True,
+            "open_id": tok.get("open_id"),
+            "expires_in": tok.get("expires_in"),
+            "scopes": TT_SCOPES.split(","),
+        }
+    )
+    if "access_token" in tok:
+        resp.set_cookie(
+            "tt_access_token",
+            tok["access_token"],
+            httponly=True,
+            secure=True,
+            samesite="Lax",
+            max_age=tok.get("expires_in", 600),
+        )
+    if "open_id" in tok:
+        resp.set_cookie(
+            "tt_open_id",
+            tok["open_id"],
+            httponly=True,
+            secure=True,
+            samesite="Lax",
+            max_age=tok.get("expires_in", 600),
+        )
+    return resp
 
-        return {"ok": True, "open_id": open_id, "expires_at": expires_at.isoformat()}
 
 @router.post("/video-list")
-async def ingest(limit: int = Query(25, ge=1, le=100), db: Session = Depends(get_db)):
-    user = db.query(TikTokUser).order_by(TikTokUser.id.desc()).first()
-    if not user:
-        raise HTTPException(400, "No TikTok user connected. Use /tiktok/login first.")
+async def video_list(request: Request, limit: int = 25):
+    token = request.cookies.get("tt_access_token")
+    open_id = request.cookies.get("tt_open_id")
+    if not token or not open_id:
+        raise HTTPException(status_code=401, detail="Not logged in with TikTok")
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        headers = {"Authorization": f"Bearer {user.access_token}", "Content-Type": "application/json"}
-        r = await client.post(TIKTOK_VIDEO_LIST, json={"max_count": limit}, headers=headers)
+    params = {
+        "open_id": open_id,
+        "max_count": max(1, min(limit, 50)),
+        "fields": "video_id,caption,create_time,cover_image_url",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(
+            VIDEO_LIST_URL,
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+        )
         if r.status_code != 200:
-            raise HTTPException(r.status_code, r.text)
-        data = r.json().get("data", {})
-        vids = data.get("videos", [])
-        cnt = 0
-        for v in vids:
-            vid = v.get("id")
-            if db.query(TikTokVideo).filter_by(video_id=vid).first():
-                continue
-            caption = v.get("video_description") or v.get("title")
-            cover = v.get("cover_image_url")
-            create_time = v.get("create_time")
-            share = v.get("share_url")
-
-            scored = _score_caption(caption or "")
-            dets = scored["detections"]
-            recs = _recs_from_detections(dets)
-
-            row = TikTokVideo(
-                user_id=user.id,
-                video_id=vid,
-                caption=caption,
-                cover_image_url=cover,
-                create_time_utc=datetime.fromtimestamp(create_time, tz=timezone.utc) if create_time else None,
-                share_url=share,
-                scanned_at=datetime.now(timezone.utc),
-                score=scored["score"],
-                band=scored["band"],
-                factors=scored["factors"],
-                detections=dets,
-                recs=recs,
-            )
-            db.add(row); cnt += 1
-        db.commit()
-        return {"ingested": cnt}
-
-@router.get("/posts")
-def list_posts(page: int = 1, page_size: int = 10, db: Session = Depends(get_db)):
-    q = db.query(TikTokVideo).order_by(TikTokVideo.create_time_utc.desc().nullslast())
-    total = q.count()
-    rows = q.offset((page - 1) * page_size).limit(page_size).all()
-    return {
-        "items": [{
-            "video_id": r.video_id,
-            "caption": r.caption,
-            "cover_image_url": r.cover_image_url,
-            "create_time_utc": r.create_time_utc,
-            "share_url": r.share_url,
-            "score": r.score,
-            "band": r.band
-        } for r in rows],
-        "page": page, "page_size": page_size, "total": total
-    }
-
-@router.get("/posts/{video_id}")
-def get_post(video_id: str, db: Session = Depends(get_db)):
-    r = db.query(TikTokVideo).filter_by(video_id=video_id).first()
-    if not r:
-        raise HTTPException(404, "Video not found")
-    return {
-        "video_id": r.video_id,
-        "caption": r.caption,
-        "cover_image_url": r.cover_image_url,
-        "create_time_utc": r.create_time_utc,
-        "share_url": r.share_url,
-        "score": r.score,
-        "band": r.band,
-        "detections": r.detections or [],
-        "factors": r.factors or {},
-        "recs": r.recs or [],
-    }
+            raise HTTPException(status_code=502, detail=f"TikTok video.list failed: {r.text}")
+        return {"ok": True, "data": r.json()}
